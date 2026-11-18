@@ -32,8 +32,10 @@ pub(crate) async fn subscribe(
         .max(0);
     // Subscribe before reading SQLite so a concurrent commit cannot be missed.
     let mut wake = state.changes.subscribe();
+    let mut stopping = state.stopping.subscribe();
     let stream = async_stream::stream! {
         loop {
+            if *stopping.borrow() { break; }
             let result = state.db.call(move |db| {
                 let latest: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
                 let changes = db.prepare("SELECT id, kind, message_id FROM events WHERE id > ?1 ORDER BY id LIMIT 100")?
@@ -61,7 +63,10 @@ pub(crate) async fn subscribe(
                     break;
                 }
             }
-            if wake.changed().await.is_err() { break; }
+            tokio::select! {
+                result = wake.changed() => { if result.is_err() { break; } },
+                _ = stopping.changed() => break,
+            }
         }
     };
     Sse::new(stream).keep_alive(

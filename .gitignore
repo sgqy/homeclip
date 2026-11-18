@@ -6,4 +6,5 @@
 /web/playwright-report/
 /.local/
 *.log
+/*.tar
 .DS_Store

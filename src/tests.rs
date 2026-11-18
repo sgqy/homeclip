@@ -438,3 +438,15 @@ async fn empty_files_and_upload_cancellation_work() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn active_event_stream_closes_when_the_server_stops() {
+    let h = Harness::new();
+    let response = h.request("GET", "/api/events", json!(null)).await;
+    let mut body = response.into_body();
+    h.state.stopping.send_replace(true);
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+        .await
+        .expect("SSE must finish before graceful shutdown waits for connections");
+    assert!(frame.is_none());
+}

@@ -1,0 +1,49 @@
+name: Verify and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: Verify Rust
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --locked
+      - name: Build web client
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Browser tests
+        working-directory: web
+        run: npx playwright install --with-deps chromium && npm test
+      - name: Build scratch image
+        run: docker build --platform linux/amd64 -t homeclip:latest .
+      - name: Verify image and persistent storage
+        run: node scripts/verify-image.mjs homeclip:latest
+      - name: Export image
+        run: docker save -o homeclip-linux-amd64.tar homeclip:latest
+      - uses: actions/upload-artifact@v7
+        with:
+          name: homeclip-linux-amd64
+          path: |
+            homeclip-linux-amd64.tar
+            compose.yaml
+            .local/image-check.json
+          include-hidden-files: true
+          retention-days: 14

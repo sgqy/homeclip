@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
+import jsQR from 'jsqr'
 import { messageSchema, pageSchema } from '../src/api'
 
 test.beforeEach(async ({ request }) => {
@@ -22,6 +23,16 @@ test('text synchronizes, replies and edits propagate, and QR carries the origina
   await expect(peer.locator('.message-text')).toHaveText(text)
   await page.getByRole('button', { name: '二维码', exact: true }).click()
   await expect(page.getByRole('img', { name: '包含消息原文的二维码' })).toBeVisible()
+  const pixels = await page.getByRole('img', { name: '包含消息原文的二维码' }).evaluate(element => {
+    if (!(element instanceof HTMLImageElement)) throw new Error('QR image missing')
+    const canvas = document.createElement('canvas')
+    canvas.width = element.naturalWidth; canvas.height = element.naturalHeight
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas unavailable')
+    context.drawImage(element, 0, 0)
+    return { width: canvas.width, height: canvas.height, data: Array.from(context.getImageData(0, 0, canvas.width, canvas.height).data) }
+  })
+  expect(jsQR(new Uint8ClampedArray(pixels.data), pixels.width, pixels.height)?.data).toBe(text)
   await expect(page.locator('.qr-text')).toHaveText(text)
   await page.screenshot({ path: testInfo.outputPath('qr.png'), fullPage: true })
   await page.getByRole('button', { name: '关闭二维码' }).click()
@@ -127,4 +138,38 @@ test('failed uploads can resume and long text gets a clear QR capacity result', 
   await page.getByRole('button', { name: '发送', exact: true }).click()
   await page.getByRole('button', { name: '二维码', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('超过单个二维码的容量')
+})
+
+test('a supported original video plays in the native browser player', async ({ page }) => {
+  await page.goto('/')
+  const bytes = await page.evaluate(async () => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 160; canvas.height = 90
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas unavailable')
+    context.fillStyle = '#d96742'; context.fillRect(0, 0, 160, 90)
+    const stream = canvas.captureStream(10)
+    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp8' })
+    const chunks: Blob[] = []
+    recorder.ondataavailable = event => chunks.push(event.data)
+    const done = new Promise<Blob>(resolve => { recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' })) })
+    recorder.start()
+    const animation = setInterval(() => { context.fillStyle = '#35362f'; context.fillRect(Math.random() * 150, 30, 10, 10) }, 50)
+    await new Promise(resolve => setTimeout(resolve, 600))
+    recorder.stop(); clearInterval(animation)
+    const blob = await done
+    for (const track of stream.getTracks()) track.stop()
+    return Array.from(new Uint8Array(await blob.arrayBuffer()))
+  })
+  await page.getByLabel('选择文件').setInputFiles({ name: '原视频.webm', mimeType: 'video/webm', buffer: Buffer.from(bytes) })
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await page.getByRole('button', { name: '预览 原视频.webm' }).click()
+  const video = page.locator('video')
+  await expect(video).toBeVisible()
+  await expect.poll(() => video.evaluate(element => element instanceof HTMLVideoElement ? element.readyState : 0)).toBeGreaterThanOrEqual(2)
+  await video.evaluate(async element => {
+    if (element instanceof HTMLVideoElement) { element.muted = true; await element.play() }
+  })
+  await expect.poll(() => video.evaluate(element => element instanceof HTMLVideoElement ? element.currentTime : 0)).toBeGreaterThan(0)
 })
