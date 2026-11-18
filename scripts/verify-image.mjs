@@ -45,8 +45,12 @@ async function json(url, options = {}) {
 function post(data) { return { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) } }
 
 try {
+  // Bind-mounted test files must remain removable by the host's unprivileged runner.
+  const user = typeof process.getuid === 'function' && typeof process.getgid === 'function'
+    ? ['--user', `${process.getuid()}:${process.getgid()}`]
+    : []
   docker('run', '-d', '--name', container, '--memory', '128m', '--memory-swap', '128m',
-    '-p', '127.0.0.1::8080', '--mount', `type=bind,source=${directory},target=/data`, image)
+    ...user, '-p', '127.0.0.1::8080', '--mount', `type=bind,source=${directory},target=/data`, image)
   created = true
   await health()
   docker('exec', container, '/homeclip', '--healthcheck')
