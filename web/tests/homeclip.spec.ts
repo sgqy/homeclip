@@ -173,3 +173,12 @@ test('a supported original video plays in the native browser player', async ({ p
   })
   await expect.poll(() => video.evaluate(element => element instanceof HTMLVideoElement ? element.currentTime : 0)).toBeGreaterThan(0)
 })
+
+test('numeric text uses QR numeric capacity instead of a byte-length cutoff', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('textbox', { name: '消息内容', exact: true }).fill('1234567890'.repeat(600))
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await page.getByRole('button', { name: '二维码', exact: true }).click()
+  await expect(page.getByRole('img', { name: '包含消息原文的二维码' })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '消息二维码' }).getByRole('alert')).toHaveCount(0)
+})
