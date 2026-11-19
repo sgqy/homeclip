@@ -30,6 +30,7 @@ pub(crate) const WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 pub(crate) struct NewUpload {
     name: String,
     size: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +42,10 @@ pub(crate) struct Upload {
     pub(crate) received: u64,
     uploaded: u64,
     pub(crate) sha256: Option<String>,
+    #[serde(skip)]
+    expected_sha256: Option<String>,
+    #[serde(skip)]
+    blob_id: Option<String>,
 }
 
 pub(crate) async fn upload(state: &AppState, id: String) -> Result<Upload> {
@@ -49,7 +54,8 @@ pub(crate) async fn upload(state: &AppState, id: String) -> Result<Upload> {
         .call(move |db| {
             db.query_row(
                 "SELECT id, name, size, mime, received, sha256,
-                    received + COALESCE((SELECT SUM(length) FROM upload_parts WHERE file_id = files.id), 0)
+                    received + COALESCE((SELECT SUM(length) FROM upload_parts WHERE file_id = files.id), 0),
+                    expected_sha256, blob_id
                  FROM files WHERE id = ?1",
                 [id],
                 |r| {
@@ -61,6 +67,8 @@ pub(crate) async fn upload(state: &AppState, id: String) -> Result<Upload> {
                         received: r.get(4)?,
                         sha256: r.get(5)?,
                         uploaded: r.get(6)?,
+                        expected_sha256: r.get(7)?,
+                        blob_id: r.get(8)?,
                     })
                 },
             )
@@ -77,30 +85,48 @@ pub(crate) async fn create(
     if input.name.is_empty() || input.name.len() > 4096 || input.size > i64::MAX as u64 {
         return Err(ApiError::bad("文件名或文件大小无效"));
     }
+    if input.sha256.len() != 64 || !input.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad("需要完整的 SHA-256 十六进制摘要"));
+    }
     let id = Uuid::new_v4().to_string();
-    let path = state.file_path(&id);
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .await?;
     let key = id.clone();
     let mime = mime_guess::from_path(&input.name)
         .first_or_octet_stream()
         .to_string();
-    if let Err(error) = state
+    let reused = state
         .db
         .call(move |db| {
-            db.execute(
-                "INSERT INTO files(id, name, size, mime, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![key, input.name, input.size, mime, db::now()],
+            let tx = db.transaction()?;
+            let hash = input.sha256.to_ascii_lowercase();
+            let blob_id: Option<String> = tx.query_row(
+                "SELECT id FROM blobs WHERE sha256 = ?1 AND size = ?2", params![hash, input.size], |r| r.get(0),
+            ).optional()?;
+            tx.execute(
+                "INSERT INTO files(id, name, size, mime, created_at, expected_sha256, blob_id, sha256, received)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![key, input.name, input.size, mime, db::now(), hash, blob_id,
+                    blob_id.as_ref().map(|_| &hash), if blob_id.is_some() { input.size } else { 0 }],
             )?;
-            Ok(())
+            tx.commit()?;
+            Ok(blob_id.is_some())
         })
-        .await
+        .await?;
+    if !reused
+        && let Err(error) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(state.file_path(&id))
+            .await
     {
-        let _ = tokio::fs::remove_file(path).await;
-        return Err(error);
+        let key = id.clone();
+        state
+            .db
+            .call(move |db| {
+                db.execute("DELETE FROM files WHERE id = ?1", [key])?;
+                Ok(())
+            })
+            .await?;
+        return Err(error.into());
     }
     Ok(Json(upload(&state, id).await?))
 }
@@ -211,6 +237,10 @@ pub(crate) async fn complete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Upload>> {
+    tokio::spawn(complete_inner(state, id)).await?
+}
+
+async fn complete_inner(state: AppState, id: String) -> Result<Json<Upload>> {
     let _lock = state.file_lock(&id).await;
     let current = upload(&state, id.clone()).await?;
     if current.sha256.is_some() {
@@ -245,14 +275,53 @@ pub(crate) async fn complete(
         Ok(format!("{:x}", hasher.finalize()))
     })
     .await??;
+    if current
+        .expected_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &hash)
+    {
+        let key = id.clone();
+        state
+            .db
+            .call(move |db| {
+                let tx = db.transaction()?;
+                tx.execute("UPDATE files SET received = 0 WHERE id = ?1", [&key])?;
+                tx.execute("DELETE FROM upload_parts WHERE file_id = ?1", [key])?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(state.file_path(&id))
+            .await?;
+        file.set_len(0).await?;
+        return Err(ApiError::unprocessable(
+            "SHA-256 不一致，文件未通过校验，请重新上传",
+        ));
+    }
     let key = id.clone();
     state
         .db
         .call(move |db| {
-            db.execute(
-                "UPDATE files SET sha256 = ?1 WHERE id = ?2",
-                params![hash, key],
+            let tx = db.transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO blobs(id, sha256, size) VALUES (?1, ?2, ?3)",
+                params![key, hash, current.size],
             )?;
+            let blob_id: String = tx.query_row(
+                "SELECT id FROM blobs WHERE sha256 = ?1 AND size = ?2",
+                params![hash, current.size],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "UPDATE files SET sha256 = ?1, blob_id = ?2 WHERE id = ?3",
+                params![hash, blob_id, key],
+            )?;
+            if blob_id != key {
+                tx.execute("INSERT OR IGNORE INTO garbage(id) VALUES (?1)", [key])?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -264,25 +333,20 @@ pub(crate) async fn cancel(
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
     let _lock = state.file_lock(&id).await;
-    let current = upload(&state, id.clone()).await?;
+    upload(&state, id.clone()).await?;
     let key = id.clone();
     state
         .db
         .call(move |db| {
             let tx = db.transaction()?;
-            let changed = tx.execute(
-                "DELETE FROM files WHERE id = ?1 AND message_id IS NULL",
-                [&key],
-            )?;
-            if changed != 1 {
-                return Err(ApiError::conflict("文件已属于一条消息"));
+            if !db::remove_unused_file(&tx, &key)? {
+                return Err(ApiError::conflict("文件仍被消息引用"));
             }
-            tx.execute("INSERT OR IGNORE INTO garbage(id) VALUES (?1)", [key])?;
             tx.commit()?;
             Ok(())
         })
         .await?;
-    remove_garbage_file(&state, &current.id).await?;
+    collect_garbage(&state).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -302,7 +366,11 @@ pub(crate) async fn content(
         return Err(ApiError::conflict("文件还未完成校验"));
     }
     let mime = file.mime.parse().map_err(ApiError::internal)?;
-    let mut response = ServeFile::new_with_mime(state.file_path(&file.id), &mime)
+    let blob_id = file
+        .blob_id
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("文件还未完成校验"))?;
+    let mut response = ServeFile::new_with_mime(state.file_path(blob_id), &mime)
         .try_call(request)
         .await
         .map_err(ApiError::internal)?

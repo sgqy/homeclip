@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
 import jsQR from 'jsqr'
-import { messageSchema, pageSchema } from '../src/api'
+import { messageSchema, pageSchema, uploadSchema } from '../src/api'
 
 test.beforeEach(async ({ request }) => {
   for (;;) {
@@ -224,4 +224,98 @@ test('four parts run concurrently across files and a lost acknowledgement resume
   await page.getByRole('button', { name: '四路并发.bin 文件信息' }).click()
   await expect(page.locator('.file-details code')).toHaveText(digest)
   await expect(page.getByRole('button', { name: '预览 同时上传.txt' })).toBeVisible()
+})
+
+test('prehash enables instant upload with independent names and shared message attachments', async ({ page, request }, testInfo) => {
+  const original = Buffer.from('相同文件，多条消息共享。\n'.repeat(1000))
+  const different = Buffer.from(original)
+  different[0] = 65
+  const digest = createHash('sha256').update(original).digest('hex')
+  let chunks = 0
+  const declarations: unknown[] = []
+  page.on('request', outgoing => {
+    if (outgoing.method() === 'PUT' && outgoing.url().includes('/chunks/')) chunks++
+    if (outgoing.method() === 'POST' && outgoing.url().endsWith('/api/uploads')) {
+      const body: unknown = JSON.parse(outgoing.postData() ?? 'null')
+      declarations.push(body)
+    }
+  })
+  await page.goto('/')
+  await page.getByLabel('选择文件').setInputFiles({ name: '原名.txt', mimeType: 'text/plain', buffer: original })
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
+  expect(chunks).toBe(1)
+  expect(declarations[0]).toMatchObject({ sha256: digest, size: original.length })
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await expect(page.locator('.message-card')).toHaveCount(1)
+  const firstId = await page.locator('.message-card').getAttribute('data-message-id')
+  await page.getByLabel('选择文件').setInputFiles([
+    { name: '副本.txt', mimeType: 'text/plain', buffer: original },
+    { name: '同大小不同内容.txt', mimeType: 'text/plain', buffer: different },
+  ])
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
+  await expect(page.locator('.upload-item').filter({ hasText: '副本.txt' })).toContainText('秒传 · 已校验')
+  expect(chunks, 'only the different content needs another upload').toBe(2)
+  expect(declarations).toContainEqual({ name: '副本.txt', size: original.length, sha256: digest })
+  const created = page.waitForResponse(response => response.url().endsWith('/api/messages') && response.request().method() === 'POST')
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  const second = messageSchema.parse(await (await created).json())
+  expect(second.attachments.map(file => file.name)).toEqual(['副本.txt', '同大小不同内容.txt'])
+  const repeated = messageSchema.parse(await (await request.post('/api/messages', { data: {
+    client_id: randomUUID(), text: '再次引用同一组附件', attachments: second.attachments.map(file => file.id),
+  } })).json())
+  expect(repeated.attachments).toEqual(second.attachments)
+  for (const id of [firstId, String(second.id)]) {
+    const card = page.locator(`[data-message-id="${id}"]`)
+    await card.getByRole('button', { name: '删除消息' }).click()
+    await card.getByRole('button', { name: '确认删除' }).click()
+    await expect(card).toHaveCount(0)
+  }
+  const survivor = page.locator(`[data-message-id="${repeated.id}"]`)
+  await expect(survivor).toBeVisible()
+  const downloadPromise = page.waitForEvent('download')
+  await survivor.getByRole('link', { name: '保存 副本.txt' }).click()
+  const download = await downloadPromise
+  expect(download.suggestedFilename()).toBe('副本.txt')
+  const saved = testInfo.outputPath('shared.txt')
+  await download.saveAs(saved)
+  expect(createHash('sha256').update(await readFile(saved)).digest('hex')).toBe(digest)
+})
+
+test('server rejects corrupted uploaded bytes and the browser can retry them', async ({ page }) => {
+  let corrupt = true
+  await page.route('**/api/uploads/*/chunks/*', async route => {
+    if (!corrupt) { await route.continue(); return }
+    corrupt = false
+    const bytes = route.request().postDataBuffer()
+    if (!bytes) throw new Error('Upload body missing')
+    const changed = Buffer.from(bytes)
+    changed[0] = 0
+    await route.fulfill({ response: await route.fetch({ postData: changed }) })
+  })
+  await page.goto('/')
+  const rejected = page.waitForResponse(response => response.url().endsWith('/complete'))
+  await page.getByLabel('选择文件').setInputFiles({ name: '一致性.txt', mimeType: 'text/plain', buffer: Buffer.from('必须保持原样') })
+  expect((await rejected).status()).toBe(422)
+  await expect(page.locator('.upload-status.failed')).toContainText('SHA-256 不一致')
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: '继续 一致性.txt' }).click()
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
+  await expect(page.locator('.upload-status')).toContainText('已校验')
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await page.getByRole('button', { name: '预览 一致性.txt' }).click()
+  await expect(page.locator('.text-preview')).toHaveText('必须保持原样')
+})
+
+test('browser refuses a completion response with a different SHA-256', async ({ page }) => {
+  await page.route('**/api/uploads/*/complete', async route => {
+    const response = await route.fetch()
+    const result = uploadSchema.parse(await response.json())
+    await route.fulfill({ response, json: { ...result, sha256: '0'.repeat(64) } })
+  })
+  await page.goto('/')
+  await page.getByLabel('选择文件').setInputFiles({ name: '双端校验.txt', mimeType: 'text/plain', buffer: Buffer.from('校验响应摘要') })
+  await expect(page.locator('.upload-status.failed')).toContainText('服务器 SHA-256 与本地文件不一致')
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: '移除 双端校验.txt' }).click()
+  await expect(page.locator('.upload-item')).toHaveCount(0)
 })

@@ -59,9 +59,10 @@ function status(task: UploadTask) {
   switch (task.status.kind) {
     case 'queued': return '等待上传'
     case 'paused': return '已暂停'
+    case 'prehash': return `计算 SHA-256 · ${formatSize(task.status.processed)} / ${formatSize(task.file.size)}`
     case 'uploading': return `${formatSize(task.received)} / ${formatSize(task.file.size)}`
-    case 'hashing': return '校验原文件…'
-    case 'ready': return `${formatSize(task.file.size)} · 已就绪`
+    case 'hashing': return '服务器校验原文件…'
+    case 'ready': return `${formatSize(task.file.size)} · ${task.status.reused ? '秒传 · 已校验' : '已校验'}`
     case 'error': return task.status.message
   }
 }
@@ -82,9 +83,9 @@ function status(task: UploadTask) {
         <div class="upload-info">
           <span class="upload-name">{{ task.file.name }}</span>
           <span class="upload-status" :class="{ failed: task.status.kind === 'error' }">{{ status(task) }}</span>
-          <progress v-if="task.status.kind !== 'ready'" :value="task.received" :max="task.file.size || 1" :aria-label="`${task.file.name} 上传进度`" />
+          <progress v-if="task.status.kind !== 'ready'" :value="task.status.kind === 'prehash' ? task.status.processed : task.received" :max="task.file.size || 1" :aria-label="`${task.file.name} ${task.status.kind === 'prehash' ? '摘要计算进度' : '上传进度'}`" />
         </div>
-        <button v-if="task.status.kind === 'uploading' || task.status.kind === 'queued'" class="icon-button" :aria-label="`暂停 ${task.file.name}`" @click="uploads.pause(task)"><Pause :size="16" /></button>
+        <button v-if="task.status.kind === 'uploading' || task.status.kind === 'queued' || task.status.kind === 'prehash'" class="icon-button" :aria-label="`暂停 ${task.file.name}`" @click="uploads.pause(task)"><Pause :size="16" /></button>
         <button v-if="task.status.kind === 'paused' || task.status.kind === 'error'" class="icon-button" :aria-label="`继续 ${task.file.name}`" @click="uploads.resume(task)"><Play v-if="task.status.kind === 'paused'" :size="16" /><RotateCcw v-else :size="16" /></button>
         <button class="icon-button" :disabled="sending" :aria-label="`移除 ${task.file.name}`" @click="remove(task)"><X :size="16" /></button>
       </div>

@@ -45,9 +45,9 @@ impl Harness {
             .unwrap()
     }
 
-    async fn create_upload(&self, name: &str, size: usize) -> String {
+    async fn create_upload(&self, name: &str, data: &[u8]) -> String {
         let response = self
-            .request("POST", "/api/uploads", json!({"name": name, "size": size}))
+            .request("POST", "/api/uploads", json!({"name": name, "size": data.len(), "sha256": format!("{:x}", Sha256::digest(data))}))
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         json_body(response).await["id"].as_str().unwrap().into()
@@ -83,7 +83,7 @@ impl Harness {
     }
 
     async fn ready_file(&self, name: &str, data: &'static str) -> String {
-        let id = self.create_upload(name, data.len()).await;
+        let id = self.create_upload(name, data.as_bytes()).await;
         if !data.is_empty() {
             assert_eq!(self.append(&id, 0, data).await.status(), StatusCode::OK);
         }
@@ -102,7 +102,7 @@ async fn json_body(response: Response) -> Value {
 #[tokio::test]
 async fn upload_resume_hash_range_and_download_keep_original_bytes() {
     let h = Harness::new();
-    let id = h.create_upload("家庭.txt", 11).await;
+    let id = h.create_upload("家庭.txt", b"hello world").await;
     assert_eq!(h.append(&id, 0, "hello ").await.status(), StatusCode::OK);
     assert_eq!(
         h.append(&id, 0, "hello ").await.status(),
@@ -202,7 +202,7 @@ async fn upload_resume_hash_range_and_download_keep_original_bytes() {
 #[tokio::test]
 async fn interrupted_chunk_is_retried_from_committed_offset_after_restart() {
     let mut h = Harness::new();
-    let id = h.create_upload("restart.txt", 6).await;
+    let id = h.create_upload("restart.txt", b"abcdef").await;
     assert_eq!(h.append(&id, 0, "abc").await.status(), StatusCode::OK);
     // Simulate bytes reaching disk just before a process dies, without committing the offset.
     std::fs::write(h.state.file_path(&id), b"abcXX").unwrap();
@@ -227,7 +227,7 @@ async fn interrupted_chunk_is_retried_from_committed_offset_after_restart() {
 #[tokio::test]
 async fn broken_or_oversized_request_does_not_advance_upload() {
     let h = Harness::new();
-    let id = h.create_upload("small.bin", 4).await;
+    let id = h.create_upload("small.bin", b"abcd").await;
     assert_eq!(
         h.append(&id, 0, "too long").await.status(),
         StatusCode::BAD_REQUEST
@@ -254,7 +254,9 @@ async fn broken_or_oversized_request_does_not_advance_upload() {
 async fn chunk_limit_does_not_limit_total_size() {
     let h = Harness::new();
     let size = crate::files::CHUNK_SIZE as usize;
-    let id = h.create_upload("large.bin", size + 1).await;
+    let mut original = vec![7; size];
+    original.push(8);
+    let id = h.create_upload("large.bin", &original).await;
     assert_eq!(
         h.append(&id, 0, vec![7u8; size + 1]).await.status(),
         StatusCode::BAD_REQUEST
@@ -285,14 +287,14 @@ async fn messages_are_atomic_idempotent_editable_and_searchable() {
     assert_eq!(created, retry);
     assert_eq!(created["text"], "  原始文字\n");
     assert_eq!(created["attachments"][0]["name"], "notes.txt");
-    let reused = h
+    let invalid = h
         .request(
             "POST",
             "/api/messages",
-            json!({"client_id":"second", "attachments":[file]}),
+            json!({"client_id":"second", "attachments":[file, "missing"]}),
         )
         .await;
-    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    assert_eq!(invalid.status(), StatusCode::CONFLICT);
     let page = json_body(h.request("GET", "/api/messages?q=notes", json!(null)).await).await;
     assert_eq!(
         page["messages"].as_array().unwrap().len(),
@@ -469,7 +471,9 @@ async fn active_event_stream_closes_when_the_server_stops() {
 async fn chunks_of_one_file_transfer_concurrently_without_overwriting_committed_bytes() {
     let h = Harness::new();
     let size = crate::files::CHUNK_SIZE as usize;
-    let id = h.create_upload("parallel.bin", size + 3).await;
+    let mut original = vec![7; size];
+    original.extend_from_slice(b"end");
+    let id = h.create_upload("parallel.bin", &original).await;
     let (started, running) = tokio::sync::oneshot::channel();
     let (release, proceed) = tokio::sync::oneshot::channel();
     let slow = Body::from_stream(async_stream::stream! {
@@ -498,8 +502,6 @@ async fn chunks_of_one_file_transfer_concurrently_without_overwriting_committed_
     });
     assert_eq!(head.status(), StatusCode::OK);
     assert_eq!(json_body(head).await["received"], size + 3);
-    let mut original = vec![7; size];
-    original.extend_from_slice(b"end");
     let completed = json_body(
         h.request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
             .await,
@@ -516,7 +518,9 @@ async fn chunks_of_one_file_transfer_concurrently_without_overwriting_committed_
 async fn parallel_gaps_survive_restart_and_bad_parts_do_not_destroy_other_ranges() {
     let mut h = Harness::new();
     let size = crate::files::CHUNK_SIZE as usize;
-    let id = h.create_upload("resume.bin", size + 3).await;
+    let mut original = vec![2; size];
+    original.extend_from_slice(b"end");
+    let id = h.create_upload("resume.bin", &original).await;
     assert_eq!(
         h.part(&id, size as u64, "end").await.status(),
         StatusCode::OK
@@ -582,7 +586,10 @@ async fn parallel_gaps_survive_restart_and_bad_parts_do_not_destroy_other_ranges
 async fn parallel_upload_can_resume_an_old_partial_chunk_and_cancel_cleans_progress() {
     let h = Harness::new();
     let size = crate::files::CHUNK_SIZE as usize;
-    let id = h.create_upload("legacy.bin", size + 1).await;
+    let mut original = vec![2; size + 1];
+    original[..3].copy_from_slice(b"abc");
+    original[size] = b'z';
+    let id = h.create_upload("legacy.bin", &original).await;
     assert_eq!(h.append(&id, 0, "abc").await.status(), StatusCode::OK);
     assert_eq!(h.part(&id, size as u64, "z").await.status(), StatusCode::OK);
     assert_eq!(
@@ -598,7 +605,7 @@ async fn parallel_upload_can_resume_an_old_partial_chunk_and_cancel_cleans_progr
     assert_eq!(&bytes[3..size], vec![2; size - 3]);
     assert_eq!(bytes[size], b'z');
 
-    let cancelled = h.create_upload("cancel.bin", size + 1).await;
+    let cancelled = h.create_upload("cancel.bin", &vec![3; size + 1]).await;
     assert_eq!(
         h.part(&cancelled, size as u64, "z").await.status(),
         StatusCode::OK
@@ -621,4 +628,320 @@ async fn parallel_upload_can_resume_an_old_partial_chunk_and_cancel_cleans_progr
         .await
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn hash_mismatch_cannot_be_published_and_can_be_retried() {
+    let h = Harness::new();
+    assert_eq!(
+        h.request(
+            "POST",
+            "/api/uploads",
+            json!({"name":"bad", "size":4, "sha256":"invalid"})
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let id = h.create_upload("checked.bin", b"good").await;
+    assert_eq!(h.part(&id, 0, "evil").await.status(), StatusCode::OK);
+    let rejected = h
+        .request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
+        .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let progress = json_body(
+        h.request("GET", &format!("/api/uploads/{id}"), json!(null))
+            .await,
+    )
+    .await;
+    assert!(progress["sha256"].is_null());
+    assert_eq!(progress["received"], 0);
+    assert_eq!(
+        h.request("GET", &format!("/api/files/{id}/content"), json!(null))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        h.request(
+            "POST",
+            "/api/messages",
+            json!({"client_id":"bad", "attachments":[id]})
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(h.part(&id, 0, "good").await.status(), StatusCode::OK);
+    let complete = h
+        .request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
+        .await;
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(complete).await["sha256"],
+        format!("{:x}", Sha256::digest(b"good"))
+    );
+    let other = h.create_upload("different.bin", b"evil").await;
+    assert!(
+        json_body(
+            h.request("GET", &format!("/api/uploads/{other}"), json!(null))
+                .await
+        )
+        .await["sha256"]
+            .is_null()
+    );
+}
+
+#[tokio::test]
+async fn deduplicated_files_keep_names_and_live_until_the_last_message_or_draft_releases_them() {
+    let h = Harness::new();
+    let original = h.ready_file("original.txt", "shared bytes").await;
+    let alias = h.create_upload("renamed.txt", b"shared bytes").await;
+    let reused = json_body(
+        h.request("GET", &format!("/api/uploads/{alias}"), json!(null))
+            .await,
+    )
+    .await;
+    assert!(reused["sha256"].is_string());
+    assert_eq!(reused["name"], "renamed.txt");
+    assert_eq!(reused["received"], 12);
+    assert!(
+        !h.state.file_path(&alias).exists(),
+        "instant upload must not create another copy"
+    );
+    let other = h.ready_file("other.txt", "different").await;
+    let one = json_body(
+        h.request(
+            "POST",
+            "/api/messages",
+            json!({"client_id":"one", "attachments":[original]}),
+        )
+        .await,
+    )
+    .await;
+    let two = json_body(
+        h.request(
+            "POST",
+            "/api/messages",
+            json!({"client_id":"two", "attachments":[original, other]}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(two["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(one["attachments"][0]["id"], two["attachments"][0]["id"]);
+    let three = json_body(
+        h.request(
+            "POST",
+            "/api/messages",
+            json!({"client_id":"three", "attachments":[alias]}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        h.request("DELETE", &format!("/api/uploads/{original}"), json!(null))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    for message in [&one, &two] {
+        assert_eq!(
+            h.request(
+                "DELETE",
+                &format!("/api/messages/{}", message["id"]),
+                json!(null)
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let download = h
+            .request("GET", &format!("/api/files/{alias}/content"), json!(null))
+            .await;
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(
+            download.into_body().collect().await.unwrap().to_bytes(),
+            "shared bytes"
+        );
+    }
+    let pending = h.create_upload("pending.txt", b"shared bytes").await;
+    h.request(
+        "DELETE",
+        &format!("/api/messages/{}", three["id"]),
+        json!(null),
+    )
+    .await;
+    assert!(
+        h.state.file_path(&original).exists(),
+        "an unsent instant-upload draft still owns its content"
+    );
+    let download = h
+        .request(
+            "GET",
+            &format!("/api/files/{pending}/content?download=1"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert!(
+        download.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("pending%2Etxt")
+    );
+    assert_eq!(
+        h.request("DELETE", &format!("/api/uploads/{pending}"), json!(null))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(!h.state.file_path(&original).exists());
+    assert!(!h.state.file_path(&other).exists());
+}
+
+#[tokio::test]
+async fn simultaneous_identical_uploads_converge_on_one_blob() {
+    let h = Harness::new();
+    let first = h.create_upload("first.txt", b"identical").await;
+    let second = h.create_upload("second.txt", b"identical").await;
+    let (a, b) = tokio::join!(
+        h.part(&first, 0, "identical"),
+        h.part(&second, 0, "identical")
+    );
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    let first_path = format!("/api/uploads/{first}/complete");
+    let second_path = format!("/api/uploads/{second}/complete");
+    let (a, b) = tokio::join!(
+        h.request("POST", &first_path, json!(null)),
+        h.request("POST", &second_path, json!(null))
+    );
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    crate::files::collect_garbage(&h.state).await.unwrap();
+    let count = h
+        .state
+        .db
+        .call(|db| Ok(db.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get::<_, u64>(0))?))
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        std::fs::read_dir(h.directory.path().join("files"))
+            .unwrap()
+            .count(),
+        1
+    );
+    h.request("DELETE", &format!("/api/uploads/{first}"), json!(null))
+        .await;
+    let download = h
+        .request("GET", &format!("/api/files/{second}/content"), json!(null))
+        .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(
+        download.into_body().collect().await.unwrap().to_bytes(),
+        "identical"
+    );
+    h.request("DELETE", &format!("/api/uploads/{second}"), json!(null))
+        .await;
+    assert_eq!(
+        std::fs::read_dir(h.directory.path().join("files"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let empty = h.ready_file("empty.txt", "").await;
+    let another = h.create_upload("another-empty.txt", b"").await;
+    let status = json_body(
+        h.request("GET", &format!("/api/uploads/{another}"), json!(null))
+            .await,
+    )
+    .await;
+    assert_eq!(status["sha256"], format!("{:x}", Sha256::digest(b"")));
+    assert!(h.state.file_path(&empty).exists());
+    assert!(!h.state.file_path(&another).exists());
+}
+
+#[tokio::test]
+async fn version_two_migration_preserves_urls_messages_pending_ranges_and_deduplicates_old_bytes() {
+    let directory = TempDir::new().unwrap();
+    std::fs::create_dir(directory.path().join("files")).unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"shared"));
+    {
+        let db = rusqlite::Connection::open(directory.path().join("homeclip.sqlite3")).unwrap();
+        db.execute_batch(include_str!("fixtures/schema_v2.sql"))
+            .unwrap();
+        db.execute_batch("INSERT INTO messages(id, client_id, text, created_at, updated_at) VALUES (1, 'one', 'first', 0, 0), (2, 'two', 'second', 0, 0);").unwrap();
+        for (id, name, message) in [("a", "one.txt", 1), ("b", "two.txt", 2)] {
+            db.execute("INSERT INTO files(id, name, size, mime, received, sha256, created_at, message_id) VALUES (?1, ?2, 6, 'text/plain', 6, ?3, 0, ?4)", rusqlite::params![id, name, hash, message]).unwrap();
+            std::fs::write(directory.path().join("files").join(id), b"shared").unwrap();
+        }
+        let size = crate::files::CHUNK_SIZE;
+        db.execute("INSERT INTO files(id, name, size, mime, created_at) VALUES ('pending', 'partial.bin', ?1, 'application/octet-stream', 0)", [size + 3]).unwrap();
+        db.execute(
+            "INSERT INTO upload_parts(file_id, offset, length) VALUES ('pending', ?1, 3)",
+            [size],
+        )
+        .unwrap();
+        let mut partial = vec![0; size as usize];
+        partial.extend_from_slice(b"end");
+        std::fs::write(directory.path().join("files/pending"), partial).unwrap();
+    }
+    let state = AppState::open(directory.path()).unwrap();
+    let h = Harness {
+        router: app::router(state.clone(), directory.path()),
+        state,
+        directory,
+    };
+    crate::files::collect_garbage(&h.state).await.unwrap();
+    assert!(!h.state.file_path("b").exists());
+    for (id, name) in [(1, "one.txt"), (2, "two.txt")] {
+        let message = json_body(
+            h.request("GET", &format!("/api/messages/{id}"), json!(null))
+                .await,
+        )
+        .await;
+        assert_eq!(message["attachments"][0]["name"], name);
+    }
+    h.request("DELETE", "/api/messages/1", json!(null)).await;
+    assert_eq!(
+        h.request("GET", "/api/files/b/content", json!(null))
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+        "shared"
+    );
+    let progress = json_body(h.request("GET", "/api/uploads/pending", json!(null)).await).await;
+    assert_eq!(progress["received"], 0);
+    assert_eq!(progress["uploaded"], 3);
+    assert_eq!(
+        h.part("pending", 0, vec![7; crate::files::CHUNK_SIZE as usize])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.request("POST", "/api/uploads/pending/complete", json!(null))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let reopened = AppState::open(h.directory.path()).unwrap();
+    let violations = reopened
+        .db
+        .call(|db| {
+            Ok(
+                db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get::<_, u64>(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
 }

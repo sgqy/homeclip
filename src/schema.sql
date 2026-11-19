@@ -12,6 +12,13 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to INTEGER REFERENCES messages(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS blobs (
+    id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    UNIQUE (sha256, size)
+);
+
 CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -19,10 +26,20 @@ CREATE TABLE IF NOT EXISTS files (
     mime TEXT NOT NULL,
     received INTEGER NOT NULL DEFAULT 0 CHECK (received >= 0 AND received <= size),
     sha256 TEXT,
+    expected_sha256 TEXT,
+    blob_id TEXT REFERENCES blobs(id),
     created_at INTEGER NOT NULL,
-    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE
+    CHECK ((sha256 IS NULL) = (blob_id IS NULL))
 );
-CREATE INDEX IF NOT EXISTS files_message ON files(message_id);
+CREATE INDEX IF NOT EXISTS files_blob ON files(blob_id);
+
+CREATE TABLE IF NOT EXISTS message_files (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    file_id TEXT NOT NULL REFERENCES files(id),
+    position INTEGER NOT NULL,
+    PRIMARY KEY (message_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS message_files_file ON message_files(file_id);
 
 -- Keep only ranges beyond the contiguous prefix. Merge and delete them as gaps close.
 CREATE TABLE IF NOT EXISTS upload_parts (
@@ -38,4 +55,4 @@ CREATE TABLE IF NOT EXISTS events (
     message_id INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY);
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;

@@ -14,8 +14,21 @@ pub(crate) struct Database(Arc<Mutex<Connection>>);
 
 impl Database {
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(5))?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        anyhow::ensure!(version <= 3, "database schema is newer than this program");
+        if matches!(version, 1 | 2) {
+            db.pragma_update(None, "foreign_keys", false)?;
+            let tx = db.transaction()?;
+            tx.execute_batch(include_str!("migrate_v3.sql"))?;
+            let violations: u64 =
+                tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+            anyhow::ensure!(violations == 0, "foreign key check failed during migration");
+            tx.commit()?;
+        }
         db.execute_batch(include_str!("schema.sql"))?;
         Ok(Self(Arc::new(Mutex::new(db))))
     }
@@ -93,7 +106,8 @@ pub(crate) fn message(db: &Connection, id: i64) -> Result<Message> {
         .ok_or_else(ApiError::missing)?;
     message.attachments = db
         .prepare(
-            "SELECT id, name, size, mime, sha256 FROM files WHERE message_id = ?1 ORDER BY rowid",
+            "SELECT f.id, f.name, f.size, f.mime, f.sha256 FROM message_files mf
+             JOIN files f ON f.id = mf.file_id WHERE mf.message_id = ?1 ORDER BY mf.position",
         )?
         .query_map([id], |r| {
             Ok(Attachment {
@@ -106,6 +120,27 @@ pub(crate) fn message(db: &Connection, id: i64) -> Result<Message> {
         })?
         .collect::<std::result::Result<_, _>>()?;
     Ok(message)
+}
+
+/// Remove an unreferenced attachment descriptor and queue bytes only when no descriptor uses them.
+pub(crate) fn remove_unused_file(db: &Connection, id: &str) -> Result<bool> {
+    let file = db.query_row(
+        "SELECT blob_id FROM files WHERE id = ?1 AND NOT EXISTS(SELECT 1 FROM message_files WHERE file_id = ?1)",
+        [id], |r| r.get::<_, Option<String>>(0),
+    ).optional()?;
+    let Some(blob_id) = file else {
+        return Ok(false);
+    };
+    db.execute("DELETE FROM files WHERE id = ?1", [id])?;
+    if let Some(blob_id) = blob_id {
+        let removed = db.execute("DELETE FROM blobs WHERE id = ?1 AND NOT EXISTS(SELECT 1 FROM files WHERE blob_id = ?1)", [&blob_id])?;
+        if removed == 1 {
+            db.execute("INSERT OR IGNORE INTO garbage(id) VALUES (?1)", [blob_id])?;
+        }
+    } else {
+        db.execute("INSERT OR IGNORE INTO garbage(id) VALUES (?1)", [id])?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn record_change(db: &Connection, kind: &str, id: i64) -> Result<()> {

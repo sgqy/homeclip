@@ -64,7 +64,8 @@ try {
   const concurrency = requestedConcurrency ?? config.upload_concurrency ?? 1
   const parallel = config.upload_concurrency !== undefined
   if (!parallel) assert.equal(concurrency, 1, 'The old protocol only supports sequential chunks')
-  const resume = await json('/uploads', post({ name: 'restart.bin', size: parallel ? chunkSize + 3 : 6 }))
+  const resumedBytes = parallel ? Buffer.concat([Buffer.alloc(chunkSize, 7), Buffer.from('end')]) : Buffer.from('abcdef')
+  const resume = await json('/uploads', post({ name: 'restart.bin', size: resumedBytes.length, sha256: createHash('sha256').update(resumedBytes).digest('hex') }))
   const saved = parallel
     ? await json(`/uploads/${resume.id}/chunks/${chunkSize}`, { method: 'PUT', body: Buffer.from('end') })
     : await json(`/uploads/${resume.id}`, { method: 'PATCH', headers: { 'upload-offset': '0' }, body: Buffer.from('abc') })
@@ -76,17 +77,17 @@ try {
   assert.equal(progress.received, parallel ? 0 : 3)
   if (parallel) assert.equal(progress.uploaded, 3, 'Out-of-order committed ranges must survive restart')
   assert.equal((await json(`/messages/${seeded.id}`)).text, '持久化检查')
-  const resumedBytes = parallel ? Buffer.concat([Buffer.alloc(chunkSize, 7), Buffer.from('end')]) : Buffer.from('abcdef')
   if (parallel) await json(`/uploads/${resume.id}/chunks/0`, { method: 'PUT', body: resumedBytes.subarray(0, chunkSize) })
   else await json(`/uploads/${resume.id}`, { method: 'PATCH', headers: { 'upload-offset': '3' }, body: Buffer.from('def') })
   assert.equal((await json(`/uploads/${resume.id}/complete`, { method: 'POST' })).sha256, createHash('sha256').update(resumedBytes).digest('hex'))
   await fetch(`${base}/api/uploads/${resume.id}`, { method: 'DELETE' })
 
-  const file = await json('/uploads', post({ name: 'large-original.bin', size: fileSize }))
   const expectedHash = createHash('sha256')
   // Prepare the expected digest outside the upload timer.
   const hashBuffer = Buffer.alloc(chunkSize)
   for (let index = 0; index < fileSize / chunkSize; index++) expectedHash.update(hashBuffer.fill(index % 251))
+  const digest = expectedHash.digest('hex')
+  const file = await json('/uploads', post({ name: 'large-original.bin', size: fileSize, sha256: digest }))
   const started = performance.now()
   for (let offset = 0; offset < fileSize;) {
     const requests = []
@@ -103,9 +104,14 @@ try {
   const hashStarted = performance.now()
   const complete = await json(`/uploads/${file.id}/complete`, { method: 'POST' })
   const hashSeconds = (performance.now() - hashStarted) / 1000
-  const digest = expectedHash.digest('hex')
   assert.equal(complete.sha256, digest)
-  await json('/messages', post({ client_id: randomUUID(), text: '原文件检查', attachments: [file.id] }))
+  const firstMessage = await json('/messages', post({ client_id: randomUUID(), text: '原文件检查', attachments: [file.id] }))
+  const duplicate = await json('/uploads', post({ name: 'same-content.bin', size: fileSize, sha256: digest }))
+  assert.equal(duplicate.sha256, digest, 'Matching bytes must skip upload')
+  assert.equal(duplicate.received, fileSize)
+  const secondMessage = await json('/messages', post({ client_id: randomUUID(), attachments: [file.id, duplicate.id] }))
+  assert.equal(secondMessage.attachments.length, 2)
+  assert.equal((await fetch(`${base}/api/messages/${firstMessage.id}`, { method: 'DELETE' })).status, 204)
   const range = await fetch(`${base}/api/files/${file.id}/content`, { headers: { Range: 'bytes=-257' } })
   assert.equal(range.status, 206)
   assert.deepEqual(Buffer.from(await range.arrayBuffer()), Buffer.alloc(257, 31))
@@ -134,7 +140,7 @@ try {
     transport: 'host loopback to Docker port, host bind-mounted storage', upload_concurrency: concurrency,
     original_file_mib: fileSize / 1024 / 1024, sha256: digest, upload_seconds: uploadSeconds, hash_seconds: hashSeconds,
     upload_mib_per_second: fileSize / 1024 / 1024 / uploadSeconds, upload_mbps: fileSize * 8 / 1_000_000 / uploadSeconds,
-    sigterm_exit_seconds: stopSeconds, checks: ['healthcheck', 'forced restart recovery', 'message persistence', '256 MiB upload', 'SHA-256', 'suffix Range', 'original download', 'shutdown with active SSE'],
+    sigterm_exit_seconds: stopSeconds, checks: ['healthcheck', 'forced restart recovery', 'message persistence', '256 MiB upload', 'client/server SHA-256', 'instant upload', 'shared attachments after deletion', 'suffix Range', 'original download', 'shutdown with active SSE'],
   }
   mkdirSync('.local', { recursive: true })
   writeFileSync('.local/image-check.json', `${JSON.stringify(result, null, 2)}\n`)

@@ -31,22 +31,38 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page>> {
-    let page = state.db.call(move |db| {
-        let limit = query.limit.unwrap_or(40).clamp(1, 100) as usize;
-        let mut ids = db.prepare(
-            "SELECT m.id FROM messages m WHERE (?1 IS NULL OR m.id < ?1)
+    let page = state
+        .db
+        .call(move |db| {
+            let limit = query.limit.unwrap_or(40).clamp(1, 100) as usize;
+            let mut ids = db
+                .prepare(
+                    "SELECT m.id FROM messages m WHERE (?1 IS NULL OR m.id < ?1)
              AND (?2 = '' OR instr(lower(m.text), lower(?2)) > 0 OR EXISTS
-               (SELECT 1 FROM files f WHERE f.message_id = m.id AND instr(lower(f.name), lower(?2)) > 0))
-             ORDER BY m.id DESC LIMIT ?3"
-        )?.query_map(params![query.before, query.q, limit + 1], |r| r.get::<_, i64>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let has_more = ids.len() > limit;
-        ids.truncate(limit);
-        let next_before = if has_more { ids.last().copied() } else { None };
-        let messages = ids.into_iter().map(|id| db::message(db, id)).collect::<Result<Vec<_>>>()?;
-        let cursor = db.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
-        Ok(Page { messages, next_before, cursor })
-    }).await?;
+               (SELECT 1 FROM message_files mf JOIN files f ON f.id = mf.file_id
+                WHERE mf.message_id = m.id AND instr(lower(f.name), lower(?2)) > 0))
+             ORDER BY m.id DESC LIMIT ?3",
+                )?
+                .query_map(params![query.before, query.q, limit + 1], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let has_more = ids.len() > limit;
+            ids.truncate(limit);
+            let next_before = if has_more { ids.last().copied() } else { None };
+            let messages = ids
+                .into_iter()
+                .map(|id| db::message(db, id))
+                .collect::<Result<Vec<_>>>()?;
+            let cursor =
+                db.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
+            Ok(Page {
+                messages,
+                next_before,
+                cursor,
+            })
+        })
+        .await?;
     Ok(Json(page))
 }
 
@@ -89,9 +105,10 @@ pub(crate) async fn create(
         tx.execute("INSERT INTO messages(client_id, text, created_at, updated_at, reply_to) VALUES (?1, ?2, ?3, ?3, ?4)",
             params![input.client_id, input.text, now, input.reply_to])?;
         let id = tx.last_insert_rowid();
-        for attachment in input.attachments {
-            let changed = tx.execute("UPDATE files SET message_id = ?1 WHERE id = ?2 AND message_id IS NULL AND sha256 IS NOT NULL", params![id, attachment])?;
-            if changed != 1 { return Err(ApiError::conflict("附件尚未上传完成、已删除或已用于另一条消息")); }
+        for (position, attachment) in input.attachments.into_iter().enumerate() {
+            let changed = tx.execute("INSERT OR IGNORE INTO message_files(message_id, file_id, position)
+                SELECT ?1, id, ?3 FROM files WHERE id = ?2 AND sha256 IS NOT NULL", params![id, attachment, position as i64])?;
+            if changed != 1 { return Err(ApiError::conflict("附件尚未上传完成、已删除或在本消息中重复")); }
         }
         db::record_change(&tx, "upsert", id)?;
         let message = db::message(&tx, id)?;
@@ -143,11 +160,10 @@ pub(crate) async fn delete(
         .call(move |db| {
             let tx = db.transaction()?;
             let message = db::message(&tx, id)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO garbage(id) SELECT id FROM files WHERE message_id = ?1",
-                [id],
-            )?;
             tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+            for file in &message.attachments {
+                db::remove_unused_file(&tx, &file.id)?;
+            }
             db::record_change(&tx, "delete", id)?;
             tx.commit()?;
             Ok(message.attachments)
