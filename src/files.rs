@@ -12,7 +12,7 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
@@ -24,6 +24,7 @@ use crate::{
 
 /// Bounds each retry and request, without limiting total file size.
 pub(crate) const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+pub(crate) const WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NewUpload {
@@ -35,18 +36,21 @@ pub(crate) struct NewUpload {
 pub(crate) struct Upload {
     id: String,
     name: String,
-    size: u64,
+    pub(crate) size: u64,
     mime: String,
-    received: u64,
-    sha256: Option<String>,
+    pub(crate) received: u64,
+    uploaded: u64,
+    pub(crate) sha256: Option<String>,
 }
 
-async fn upload(state: &AppState, id: String) -> Result<Upload> {
+pub(crate) async fn upload(state: &AppState, id: String) -> Result<Upload> {
     state
         .db
         .call(move |db| {
             db.query_row(
-                "SELECT id, name, size, mime, received, sha256 FROM files WHERE id = ?1",
+                "SELECT id, name, size, mime, received, sha256,
+                    received + COALESCE((SELECT SUM(length) FROM upload_parts WHERE file_id = files.id), 0)
+                 FROM files WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(Upload {
@@ -56,6 +60,7 @@ async fn upload(state: &AppState, id: String) -> Result<Upload> {
                         mime: r.get(3)?,
                         received: r.get(4)?,
                         sha256: r.get(5)?,
+                        uploaded: r.get(6)?,
                     })
                 },
             )
@@ -113,6 +118,15 @@ pub(crate) async fn append(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<Upload>> {
+    tokio::spawn(append_inner(state, id, headers, body)).await?
+}
+
+async fn append_inner(
+    state: AppState,
+    id: String,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Upload>> {
     let offset = headers
         .get("upload-offset")
         .and_then(|h| h.to_str().ok())
@@ -131,6 +145,20 @@ pub(crate) async fn append(
     if offset != current.received {
         return Err(ApiError::conflict("上传位置已变化，请重新查询进度"));
     }
+    let key = id.clone();
+    let has_parts = state
+        .db
+        .call(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM upload_parts WHERE file_id = ?1)",
+                [key],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .await?;
+    if has_parts {
+        return Err(ApiError::conflict("存在并发分片，请使用分片接口继续上传"));
+    }
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(state.file_path(&current.id))
@@ -138,6 +166,8 @@ pub(crate) async fn append(
     // Remove bytes from a request interrupted before its SQLite offset was committed.
     file.set_len(offset).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
+    file.set_max_buf_size(WRITE_BUFFER_SIZE);
+    let mut file = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
     let mut stream = body.into_data_stream();
     let mut written = 0u64;
     let write_result: Result<()> = async {
@@ -152,12 +182,15 @@ pub(crate) async fn append(
         if written == 0 {
             return Err(ApiError::bad("分片为空"));
         }
-        file.sync_data().await?;
+        file.flush().await?;
+        file.get_ref().sync_data().await?;
         Ok(())
     }
     .await;
     if let Err(error) = write_result {
-        file.set_len(offset).await?;
+        // Finish any pending blocking write before truncating or releasing the lock.
+        let _ = file.flush().await;
+        file.get_ref().set_len(offset).await?;
         return Err(error);
     }
     let key = id.clone();

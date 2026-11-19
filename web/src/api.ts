@@ -20,9 +20,9 @@ export const changeSchema = z.object({
   id: z.number(), kind: z.enum(['upsert', 'delete']), message_id: z.number(),
 })
 export const uploadSchema = attachmentSchema.omit({ sha256: true }).extend({
-  received: z.number(), sha256: z.string().nullable(),
+  received: z.number().nonnegative(), uploaded: z.number().nonnegative(), sha256: z.string().nullable(),
 })
-export const configSchema = z.object({ chunk_size: z.number().positive(), version: z.string() })
+export const configSchema = z.object({ chunk_size: z.number().int().positive(), upload_concurrency: z.number().int().positive(), version: z.string() })
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message) }

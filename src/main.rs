@@ -1,6 +1,7 @@
 //! Homeclip's single-process HTTP server.
 
 mod app;
+mod chunks;
 mod db;
 mod error;
 mod events;
@@ -21,7 +22,7 @@ fn main() -> anyhow::Result<()> {
         return healthcheck();
     }
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()?
         .block_on(run())

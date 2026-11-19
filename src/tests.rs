@@ -68,6 +68,20 @@ impl Harness {
             .unwrap()
     }
 
+    async fn part(&self, id: &str, offset: u64, data: impl Into<Body>) -> Response {
+        self.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/uploads/{id}/chunks/{offset}"))
+                    .body(data.into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn ready_file(&self, name: &str, data: &'static str) -> String {
         let id = self.create_upload(name, data.len()).await;
         if !data.is_empty() {
@@ -449,4 +463,162 @@ async fn active_event_stream_closes_when_the_server_stops() {
         .await
         .expect("SSE must finish before graceful shutdown waits for connections");
     assert!(frame.is_none());
+}
+
+#[tokio::test]
+async fn chunks_of_one_file_transfer_concurrently_without_overwriting_committed_bytes() {
+    let h = Harness::new();
+    let size = crate::files::CHUNK_SIZE as usize;
+    let id = h.create_upload("parallel.bin", size + 3).await;
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, proceed) = tokio::sync::oneshot::channel();
+    let slow = Body::from_stream(async_stream::stream! {
+        yield Ok::<_, std::io::Error>(Bytes::from(vec![7; 64 * 1024]));
+        started.send(()).unwrap();
+        proceed.await.unwrap();
+        yield Ok(Bytes::from(vec![7; size - 64 * 1024]));
+    });
+    let (head, ()) = tokio::join!(h.part(&id, 0, slow), async {
+        running.await.unwrap();
+        let tail = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            h.part(&id, size as u64, "end"),
+        )
+        .await
+        .expect("another part must finish while the first request is still streaming");
+        assert_eq!(tail.status(), StatusCode::OK);
+        let progress = json_body(tail).await;
+        assert_eq!(progress["received"], 0);
+        assert_eq!(progress["uploaded"], 3);
+        assert_eq!(
+            h.part(&id, size as u64, "BAD").await.status(),
+            StatusCode::OK
+        );
+        release.send(()).unwrap();
+    });
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(json_body(head).await["received"], size + 3);
+    let mut original = vec![7; size];
+    original.extend_from_slice(b"end");
+    let completed = json_body(
+        h.request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        completed["sha256"],
+        format!("{:x}", Sha256::digest(&original))
+    );
+    assert_eq!(std::fs::read(h.state.file_path(&id)).unwrap(), original);
+}
+
+#[tokio::test]
+async fn parallel_gaps_survive_restart_and_bad_parts_do_not_destroy_other_ranges() {
+    let mut h = Harness::new();
+    let size = crate::files::CHUNK_SIZE as usize;
+    let id = h.create_upload("resume.bin", size + 3).await;
+    assert_eq!(
+        h.part(&id, size as u64, "end").await.status(),
+        StatusCode::OK
+    );
+    h.state = AppState::open(h.directory.path()).unwrap();
+    h.router = app::router(h.state.clone(), h.directory.path());
+    assert_eq!(
+        h.request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(h.append(&id, 0, "abc").await.status(), StatusCode::CONFLICT);
+    assert_eq!(h.part(&id, 1, "abc").await.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        h.part(&id, (size + 3) as u64, "a").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.part(&id, 0, vec![1; size + 1]).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.part(&id, 0, "short").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let broken = futures_util::stream::iter([
+        Ok(Bytes::from(vec![1; 2 * 1024 * 1024])),
+        Err(std::io::Error::other("disconnected")),
+    ]);
+    assert_eq!(
+        h.part(&id, 0, Body::from_stream(broken)).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let progress = json_body(
+        h.request("GET", &format!("/api/uploads/{id}"), json!(null))
+            .await,
+    )
+    .await;
+    assert_eq!(progress["received"], 0);
+    assert_eq!(progress["uploaded"], 3);
+    assert_eq!(h.part(&id, 0, vec![2; size]).await.status(), StatusCode::OK);
+    let bytes = std::fs::read(h.state.file_path(&id)).unwrap();
+    assert_eq!(&bytes[..size], vec![2; size]);
+    assert_eq!(&bytes[size..], b"end");
+    let remaining = h
+        .state
+        .db
+        .call(move |db| {
+            Ok(db.query_row("SELECT COUNT(*) FROM upload_parts", [], |r| {
+                r.get::<_, u64>(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "merged ranges must not accumulate for large files"
+    );
+}
+
+#[tokio::test]
+async fn parallel_upload_can_resume_an_old_partial_chunk_and_cancel_cleans_progress() {
+    let h = Harness::new();
+    let size = crate::files::CHUNK_SIZE as usize;
+    let id = h.create_upload("legacy.bin", size + 1).await;
+    assert_eq!(h.append(&id, 0, "abc").await.status(), StatusCode::OK);
+    assert_eq!(h.part(&id, size as u64, "z").await.status(), StatusCode::OK);
+    assert_eq!(
+        h.part(&id, 3, vec![2; size - 3]).await.status(),
+        StatusCode::OK
+    );
+    let completed = h
+        .request("POST", &format!("/api/uploads/{id}/complete"), json!(null))
+        .await;
+    assert_eq!(completed.status(), StatusCode::OK);
+    let bytes = std::fs::read(h.state.file_path(&id)).unwrap();
+    assert_eq!(&bytes[..3], b"abc");
+    assert_eq!(&bytes[3..size], vec![2; size - 3]);
+    assert_eq!(bytes[size], b'z');
+
+    let cancelled = h.create_upload("cancel.bin", size + 1).await;
+    assert_eq!(
+        h.part(&cancelled, size as u64, "z").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.request("DELETE", &format!("/api/uploads/{cancelled}"), json!(null))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(!h.state.file_path(&cancelled).exists());
+    let remaining = h
+        .state
+        .db
+        .call(move |db| {
+            Ok(db.query_row("SELECT COUNT(*) FROM upload_parts", [], |r| {
+                r.get::<_, u64>(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
 }

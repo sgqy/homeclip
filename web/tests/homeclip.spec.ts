@@ -182,3 +182,46 @@ test('numeric text uses QR numeric capacity instead of a byte-length cutoff', as
   await expect(page.getByRole('img', { name: '包含消息原文的二维码' })).toBeVisible()
   await expect(page.getByRole('dialog', { name: '消息二维码' }).getByRole('alert')).toHaveCount(0)
 })
+
+test('four parts run concurrently across files and a lost acknowledgement resumes safely', async ({ page }) => {
+  test.setTimeout(90_000)
+  const chunkSize = 8 * 1024 * 1024
+  const original = Buffer.alloc(3 * chunkSize + 123, 37)
+  const digest = createHash('sha256').update(original).digest('hex')
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let started = 0
+  let active = 0
+  let peak = 0
+  let lostAck = false
+  await page.route('**/api/uploads/*/chunks/*', async route => {
+    started++
+    peak = Math.max(peak, ++active)
+    try {
+      if (started <= 4) await gate
+      const response = await route.fetch()
+      if (!lostAck && route.request().url().endsWith(`/chunks/${chunkSize}`)) {
+        lostAck = true
+        expect(response.ok()).toBeTruthy()
+        await route.abort('failed')
+      } else await route.fulfill({ response })
+    } finally { active-- }
+  })
+  await page.goto('/')
+  await page.getByLabel('选择文件').setInputFiles([
+    { name: '四路并发.bin', mimeType: 'application/octet-stream', buffer: original },
+    { name: '同时上传.txt', mimeType: 'text/plain', buffer: Buffer.from('第二个文件') },
+  ])
+  try {
+    await expect.poll(() => started).toBe(4)
+    expect(await page.evaluate(async () => (await fetch('/api/health')).text())).toBe('ok')
+    expect(started).toBe(4)
+  } finally { release() }
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled({ timeout: 60_000 })
+  expect(lostAck).toBe(true)
+  expect(peak).toBe(4)
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await page.getByRole('button', { name: '四路并发.bin 文件信息' }).click()
+  await expect(page.locator('.file-details code')).toHaveText(digest)
+  await expect(page.getByRole('button', { name: '预览 同时上传.txt' })).toBeVisible()
+})

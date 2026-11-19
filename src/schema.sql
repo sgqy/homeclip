@@ -24,10 +24,18 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_message ON files(message_id);
 
+-- Keep only ranges beyond the contiguous prefix. Merge and delete them as gaps close.
+CREATE TABLE IF NOT EXISTS upload_parts (
+    file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    offset INTEGER NOT NULL CHECK (offset >= 0),
+    length INTEGER NOT NULL CHECK (length > 0),
+    PRIMARY KEY (file_id, offset)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
     message_id INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY);
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

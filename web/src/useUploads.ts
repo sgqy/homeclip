@@ -17,15 +17,43 @@ export interface UploadTask {
 export function useUploads() {
   const tasks = ref<UploadTask[]>([])
   const active = new Map<string, AbortController>()
-  let chunkSize: number | undefined
+  let config: Promise<{ chunk_size: number; upload_concurrency: number }> | undefined
+  let sending = 0
+  const waiting: Array<() => void> = []
   let disposed = false
   const ready = computed(() => tasks.value.every(task => task.status.kind === 'ready'))
   const attachments = computed(() => tasks.value.flatMap(task => task.status.kind === 'ready' ? [task.status.attachment] : []))
 
+  async function sendChunk(path: string, file: File, offset: number, end: number, concurrency: number, signal: AbortSignal) {
+    // Share four upload connections across files, leaving room for SSE and API calls.
+    await new Promise<void>((resolve, reject) => {
+      signal.throwIfAborted()
+      function start() { signal.removeEventListener('abort', cancel); sending++; resolve() }
+      function cancel() {
+        const index = waiting.indexOf(start)
+        if (index !== -1) waiting.splice(index, 1)
+        reject(signal.reason)
+      }
+      if (sending < concurrency) start()
+      else { waiting.push(start); signal.addEventListener('abort', cancel, { once: true }) }
+    })
+    try {
+      signal.throwIfAborted()
+      return await api(`${path}/chunks/${offset}`, uploadSchema, {
+        method: 'PUT', body: file.slice(offset, end), signal,
+      })
+    } finally {
+      sending--
+      waiting.shift()?.()
+    }
+  }
+
   async function run(task: UploadTask, controller: AbortController) {
     const signal = controller.signal
     try {
-      chunkSize ??= (await api('/config', configSchema, { signal })).chunk_size
+      config ??= api('/config', configSchema).catch((cause: unknown) => { config = undefined; throw cause })
+      const { chunk_size: chunkSize, upload_concurrency: concurrency } = await config
+      signal.throwIfAborted()
       task.status = { kind: 'uploading' }
       if (!task.serverId) {
         const upload = await api('/uploads', uploadSchema, {
@@ -39,18 +67,25 @@ export function useUploads() {
         signal.throwIfAborted()
         try {
           const current = await api(path, uploadSchema, { signal })
-          task.received = current.received
+          task.received = current.uploaded
           if (current.sha256 !== null) {
             task.status = { kind: 'ready', attachment: attachmentSchema.parse(current) }
             return
           }
-          while (task.received < task.file.size) {
-            const end = Math.min(task.received + chunkSize, task.file.size)
-            const result = await api(path, uploadSchema, {
-              method: 'PATCH', headers: { 'upload-offset': String(task.received) },
-              body: task.file.slice(task.received, end), signal,
-            })
-            task.received = result.received
+          let offset = current.received
+          while (offset < task.file.size) {
+            const batch: Promise<void>[] = []
+            for (let index = 0; index < concurrency && offset < task.file.size; index++) {
+              const end = Math.min(offset + chunkSize - offset % chunkSize, task.file.size)
+              batch.push(sendChunk(path, task.file, offset, end, concurrency, signal).then(result => {
+                task.received = Math.max(task.received, result.uploaded)
+              }))
+              offset = end
+            }
+            // Settle all outstanding parts before querying progress or starting a retry.
+            const results = await Promise.allSettled(batch)
+            const failed = results.find(result => result.status === 'rejected')
+            if (failed?.status === 'rejected') throw failed.reason
             failures = 0
           }
           task.status = { kind: 'hashing' }
